@@ -170,6 +170,8 @@ def _build_photo_sync_options(
     only_print_filenames: bool,
     dry_run: bool,
     auto_delete: bool,
+    sync_mode: str = "auto",
+    full_scan: bool = False,
 ) -> PhotoSyncOptions:
     """Build one canonical sync options object for sync-style commands."""
 
@@ -192,6 +194,8 @@ def _build_photo_sync_options(
         only_print_filenames=only_print_filenames,
         dry_run=dry_run,
         auto_delete=auto_delete,
+        sync_mode=sync_mode,
+        full_scan=full_scan,
     )
 
 
@@ -825,6 +829,16 @@ def photos_sync(
         "--auto-delete",
         help="Delete local files that are no longer present remotely for this sync target.",
     ),
+    sync_mode: str = typer.Option(
+        "auto",
+        "--sync-mode",
+        help="Sync strategy: auto (delta when possible, fallback to full), full (always enumerate all), incremental (delta only, error if unavailable).",
+    ),
+    full_scan: bool = typer.Option(
+        False,
+        "--full-scan",
+        help="One-time override: force full enumeration this run regardless of sync-mode.",
+    ),
     username: UsernameOption = None,
     session_dir: SessionDirOption = None,
     http_proxy: HttpProxyOption = None,
@@ -863,6 +877,8 @@ def photos_sync(
         only_print_filenames=only_print_filenames,
         dry_run=dry_run,
         auto_delete=auto_delete,
+        sync_mode=sync_mode,
+        full_scan=full_scan,
     )
     try:
         sync_result = service_call(
@@ -981,6 +997,16 @@ def photos_watch(
         "--auto-delete",
         help="Delete local files that are no longer present remotely for this sync target.",
     ),
+    sync_mode: str = typer.Option(
+        "auto",
+        "--sync-mode",
+        help="Sync strategy: auto (delta when possible, fallback to full), full (always enumerate all), incremental (delta only, error if unavailable).",
+    ),
+    full_scan: bool = typer.Option(
+        False,
+        "--full-scan",
+        help="One-time override: force full enumeration this run regardless of sync-mode.",
+    ),
     interval: int = typer.Option(
         300,
         "--interval",
@@ -1032,6 +1058,8 @@ def photos_watch(
         only_print_filenames=only_print_filenames,
         dry_run=dry_run,
         auto_delete=auto_delete,
+        sync_mode=sync_mode,
+        full_scan=full_scan,
     )
     try:
         if state.json_output:

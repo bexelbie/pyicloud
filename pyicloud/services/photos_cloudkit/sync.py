@@ -18,6 +18,13 @@ from .constants import (
     legacy_shared_stream_unsupported_message,
     unsupported_shared_library_album_message,
 )
+from .delta import (
+    DeltaSyncError,
+    DeltaSyncTokenInvalid,
+    DeltaSyncUnavailable,
+    DeltaSyncZoneNotFound,
+    iter_delta_changes,
+)
 from .materialize import (
     apply_align_raw_policy,
     set_exif_datetime_if_missing,
@@ -55,6 +62,8 @@ class PhotoSyncOptions:
     only_print_filenames: bool = False
     dry_run: bool = False
     auto_delete: bool = False
+    sync_mode: str = "auto"  # "auto" | "full" | "incremental"
+    full_scan: bool = False  # one-time override: force full enumeration this run
 
     def normalized_albums(self) -> tuple[str, ...]:
         """Return a stable album selection tuple."""
@@ -256,6 +265,33 @@ def run_photo_sync(service: Any, options: PhotoSyncOptions) -> PhotoSyncResult:
         ):
             result.short_circuited = True
             return result
+
+        # --- Delta sync decision ---
+        stored_cursor = state.get_sync_cursor()
+        use_delta = _should_use_delta(options, stored_cursor, current_cursor)
+
+        if use_delta and stored_cursor:
+            delta_ok = _run_delta_sync(
+                service=service,
+                library=selected_library,
+                options=options,
+                state=state,
+                result=result,
+                stored_cursor=stored_cursor,
+            )
+            if delta_ok:
+                # Delta sync succeeded — advance cursor and return
+                if not options.only_print_filenames and not options.dry_run:
+                    state.set_sync_cursor(current_cursor)
+                return result
+            elif options.sync_mode == "incremental":
+                # Incremental mode doesn't fall back — error already raised or logged
+                return result
+            else:
+                # Auto mode: delta failed, fall through to full enumeration
+                _LOGGER.info("Falling back to full enumeration")
+
+        # --- Full enumeration path (original behavior) ---
 
         current_entries: set[tuple[str, str]] = set()
         reserved_paths: set[str] = set()
@@ -508,6 +544,305 @@ def _sync_cursor(library: Any, service: Any) -> str | None:
     if hasattr(service, "sync_cursor"):
         return service.sync_cursor()
     return None
+
+
+def _should_use_delta(
+    options: PhotoSyncOptions,
+    stored_cursor: str | None,
+    current_cursor: str | None,
+) -> bool:
+    """Decide whether to attempt delta sync for this run.
+
+    Returns True if delta sync should be attempted. The caller is responsible
+    for handling fallback to full enumeration on failure (when mode=auto).
+    """
+    if options.full_scan:
+        _LOGGER.info("Full scan forced by --full-scan flag")
+        return False
+    if options.sync_mode == "full":
+        return False
+    if options.sync_mode == "incremental":
+        if not stored_cursor:
+            raise PhotosServiceException(
+                "sync-mode=incremental requires a stored sync cursor from a prior run. "
+                "Run with sync-mode=auto or sync-mode=full first."
+            )
+        return True
+    # mode == "auto": use delta when we have a stored cursor that differs from current
+    if not stored_cursor:
+        _LOGGER.debug("No stored cursor — full enumeration required for first sync")
+        return False
+    if stored_cursor == current_cursor:
+        # Should have been short-circuited already, but just in case
+        return False
+    _LOGGER.info("Stored cursor differs from current — attempting delta sync")
+    return True
+
+
+def _run_delta_sync(
+    service: Any,
+    library: Any,
+    options: PhotoSyncOptions,
+    state: PhotoSyncState,
+    result: "PhotoSyncResult",
+    stored_cursor: str,
+) -> bool:
+    """Execute the delta sync path using /changes/zone.
+
+    Processes change events from the CloudKit changes API, downloading new
+    assets and marking deletions in state.
+
+    Returns True if delta sync completed successfully (cursor should be advanced).
+    Returns False if delta sync encountered errors (cursor should NOT advance).
+    """
+    from .service import PhotoAsset
+
+    sync_complete = True
+    tracked_resources = list(state.iter_resources())
+    tracked_paths: dict[str, tuple[str, str]] = {
+        entry.relative_path: (entry.asset_id, entry.resource_key)
+        for entry in tracked_resources
+    }
+    reserved_paths: set[str] = set()
+
+    try:
+        for events, page_token in iter_delta_changes(library, stored_cursor):
+            _ = page_token  # available for crash-safe resume in future
+            for event in events:
+                if event.kind in ("hard_deleted", "soft_deleted"):
+                    _handle_delta_deletion(
+                        event=event,
+                        state=state,
+                        options=options,
+                        result=result,
+                    )
+                elif event.kind == "created":
+                    if event.master_record is None or event.asset_record is None:
+                        # Unpaired record — can't construct a full asset, skip
+                        _LOGGER.debug(
+                            "Skipping unpaired change event for %s",
+                            event.master_record_name,
+                        )
+                        continue
+                    try:
+                        asset = PhotoAsset(
+                            service=service,
+                            master_record=event.master_record,
+                            asset_record=event.asset_record,
+                        )
+                    except Exception as exc:
+                        _LOGGER.warning(
+                            "Failed to construct PhotoAsset from delta record %s: %s",
+                            event.master_record_name,
+                            exc,
+                        )
+                        sync_complete = False
+                        continue
+
+                    ok = _sync_single_asset(
+                        asset=asset,
+                        options=options,
+                        state=state,
+                        result=result,
+                        reserved_paths=reserved_paths,
+                        tracked_paths=tracked_paths,
+                    )
+                    if not ok:
+                        sync_complete = False
+    except DeltaSyncTokenInvalid:
+        _LOGGER.warning(
+            "Sync token rejected by iCloud — will fall back to full enumeration"
+        )
+        return False
+    except DeltaSyncZoneNotFound:
+        _LOGGER.warning("Zone no longer exists — skipping delta sync")
+        return False
+    except DeltaSyncUnavailable as exc:
+        _LOGGER.info("Delta sync unavailable: %s", exc)
+        return False
+    except DeltaSyncError as exc:
+        _LOGGER.warning("Delta sync error: %s", exc)
+        sync_complete = False
+
+    return sync_complete
+
+
+def _handle_delta_deletion(
+    *,
+    event: Any,
+    state: PhotoSyncState,
+    options: "PhotoSyncOptions",
+    result: "PhotoSyncResult",
+) -> None:
+    """Handle a deletion event from the delta stream.
+
+    Marks the resource as deleted in state. If auto_delete is enabled,
+    removes the local file. Otherwise, local files are left intact for
+    the existing auto_delete pass to handle.
+    """
+    # Look up all resources for this asset in state
+    resources = list(state.iter_resources_by_asset(event.master_record_name))
+    if not resources:
+        _LOGGER.debug(
+            "Deletion event for %s but no local state found — already cleaned",
+            event.master_record_name,
+        )
+        return
+
+    for entry in resources:
+        if options.auto_delete and not options.dry_run:
+            try:
+                target_path = _safe_target_path(options.directory, entry.relative_path)
+                if target_path.exists():
+                    target_path.unlink()
+                    _LOGGER.info("Deleted local file: %s", entry.relative_path)
+            except (PhotosServiceException, OSError) as exc:
+                _LOGGER.warning(
+                    "Failed to delete local file '%s': %s",
+                    entry.relative_path,
+                    exc,
+                )
+        state.delete_resource(entry.asset_id, entry.resource_key)
+
+        result.items.append(
+            PhotoSyncItem(
+                asset_id=entry.asset_id,
+                resource_key=entry.resource_key,
+                path=entry.relative_path,
+                action="deleted",
+                reason=f"delta-{event.kind}",
+            )
+        )
+        result.deleted_count += 1
+
+
+def _sync_single_asset(
+    *,
+    asset: Any,
+    options: "PhotoSyncOptions",
+    state: PhotoSyncState,
+    result: "PhotoSyncResult",
+    reserved_paths: set[str],
+    tracked_paths: dict[str, tuple[str, str]],
+) -> bool:
+    """Download/skip a single asset from the delta stream.
+
+    Returns True if the asset was fully processed without errors.
+    """
+    resources = _select_resources(asset, options)
+    if not resources:
+        return True
+
+    all_ok = True
+    for resource_key, resource in resources:
+        relative_path = _unique_relative_path(
+            candidate=_render_relative_path(asset, resource, options.folder_structure),
+            asset_id=asset.id,
+            resource_key=resource_key,
+            reserved_paths=reserved_paths,
+            tracked_paths=tracked_paths,
+        )
+        reserved_paths.add(relative_path)
+
+        try:
+            target_path = _safe_target_path(options.directory, relative_path)
+        except PhotosServiceException as exc:
+            _LOGGER.warning(
+                "Skipping resource with unsafe path '%s': %s", relative_path, exc
+            )
+            result.items.append(
+                PhotoSyncItem(
+                    asset_id=asset.id,
+                    resource_key=resource_key,
+                    path=relative_path,
+                    action="skipped",
+                    reason="unsafe-path",
+                )
+            )
+            result.skipped_count += 1
+            all_ok = False
+            continue
+
+        manifest = state.get_resource(asset.id, resource_key)
+        if _is_current_file(target_path, manifest, resource, relative_path):
+            result.items.append(
+                PhotoSyncItem(
+                    asset_id=asset.id,
+                    resource_key=resource_key,
+                    path=relative_path,
+                    action="skipped",
+                    reason="already-current",
+                )
+            )
+            result.skipped_count += 1
+            _apply_local_metadata(
+                asset=asset,
+                resource=resource,
+                resource_key=resource_key,
+                target_path=target_path,
+                options=options,
+            )
+            continue
+
+        if options.only_print_filenames or options.dry_run:
+            action = "listed"
+            result.items.append(
+                PhotoSyncItem(
+                    asset_id=asset.id,
+                    resource_key=resource_key,
+                    path=relative_path,
+                    action=action,
+                    reason="dry-run" if options.dry_run else "print-only",
+                )
+            )
+            result.listed_count += 1
+            continue
+
+        data = asset.download(version=resource_key)
+        if data is None:
+            result.items.append(
+                PhotoSyncItem(
+                    asset_id=asset.id,
+                    resource_key=resource_key,
+                    path=relative_path,
+                    action="skipped",
+                    reason="missing-download-data",
+                )
+            )
+            result.skipped_count += 1
+            all_ok = False
+            continue
+
+        _atomic_write_bytes(target_path, data)
+        _apply_local_metadata(
+            asset=asset,
+            resource=resource,
+            resource_key=resource_key,
+            target_path=target_path,
+            options=options,
+        )
+        downloaded_at = datetime.now(timezone.utc).isoformat()
+        state.upsert_resource(
+            SyncedPhotoResource(
+                asset_id=asset.id,
+                resource_key=resource_key,
+                relative_path=relative_path,
+                size=resource.size,
+                checksum=getattr(resource, "checksum", None),
+                downloaded_at=downloaded_at,
+            )
+        )
+        result.items.append(
+            PhotoSyncItem(
+                asset_id=asset.id,
+                resource_key=resource_key,
+                path=relative_path,
+                action="downloaded",
+            )
+        )
+        result.downloaded_count += 1
+
+    return all_ok
 
 
 def _can_short_circuit(

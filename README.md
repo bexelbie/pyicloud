@@ -825,6 +825,8 @@ icloud photos list --library 'shared:<zoneName>' --album Favorites --limit 20 --
 icloud photos get photo-id-123 --format json --username jappleseed@apple.com
 icloud photos get photo-id-123 --library 'shared:<zoneName>' --format json --username jappleseed@apple.com
 icloud photos sync --directory ./downloads --recent 30 --folder-structure '{:%Y/%m}' --username jappleseed@apple.com
+icloud photos sync --directory ./downloads --sync-mode incremental --username jappleseed@apple.com
+icloud photos sync --directory ./downloads --full-scan --username jappleseed@apple.com
 icloud photos sync --library 'shared:<zoneName>' --directory ./shared-downloads --username jappleseed@apple.com
 icloud photos sync --directory ./downloads --album Favorites --size original --live-photo-size medium --username jappleseed@apple.com
 icloud photos watch --directory ./downloads --recent 1 --interval 300 --username jappleseed@apple.com
@@ -848,6 +850,37 @@ Library-key notes:
 `--live-photo-size`, `--skip-videos`, `--skip-live-photos`, `--align-raw`,
 `--xmp-sidecar`, `--set-exif-datetime`, `--only-print-filenames`, `--dry-run`,
 `--auto-delete`, and `--keep-icloud-recent-days`.
+
+#### Incremental (delta) sync
+
+By default, `sync` and `watch` use Apple's CloudKit `/changes/zone` API to
+process only assets that have changed since the last successful run, avoiding
+full library enumeration. This is controlled by `--sync-mode`:
+
+| Mode          | Behaviour                                                    |
+|---------------|--------------------------------------------------------------|
+| `auto`        | Use delta sync when a stored cursor exists; fall back to full enumeration on first run or on failure. **(default)** |
+| `full`        | Always enumerate the entire library. Useful for repair or when you suspect drift. |
+| `incremental` | Use delta sync only; error if no stored cursor is available. Ensures full scans never happen accidentally. |
+
+A one-time `--full-scan` flag forces full enumeration for a single run without
+changing the configured `--sync-mode`:
+
+```bash
+# Normal incremental operation
+icloud photos sync --directory ./downloads --username you@example.com
+
+# Force one full re-check (e.g., after changing filter options)
+icloud photos sync --directory ./downloads --full-scan --username you@example.com
+```
+
+**State and sync tokens**: Each unique combination of sync options (library,
+albums, directory, size, folder structure, etc.) gets its own state database
+under `<directory>/.pyicloud-state/`. The sync token is stored there after each
+fully successful run. If you change filter options like `--recent`, `--album`,
+or `--size`, that produces a different state file — so the first run with new
+options will always do a full enumeration. Use `--full-scan` explicitly when
+you want to re-verify an existing configuration without changing options.
 
 ### Migrating from `icloud_photos_downloader`
 

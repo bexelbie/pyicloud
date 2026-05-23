@@ -56,6 +56,9 @@ class PhotoSyncState(Protocol):
     def iter_resources(self) -> Iterator[SyncedPhotoResource]:
         """Iterate all tracked resources."""
 
+    def iter_resources_by_asset(self, asset_id: str) -> Iterator[SyncedPhotoResource]:
+        """Iterate all tracked resources for a given asset."""
+
     def resource_count(self) -> int:
         """Return the number of tracked resources."""
 
@@ -228,6 +231,28 @@ class SQLitePhotoSyncState:
                 downloaded_at=row["downloaded_at"],
             )
 
+    def iter_resources_by_asset(self, asset_id: str) -> Iterator[SyncedPhotoResource]:
+        """Iterate all tracked resources for a given asset."""
+
+        rows = self.conn.execute(
+            """
+            SELECT asset_id, resource_key, relative_path, size, checksum, downloaded_at
+            FROM synced_resources
+            WHERE asset_id = ?
+            ORDER BY resource_key
+            """,
+            (asset_id,),
+        )
+        for row in rows:
+            yield SyncedPhotoResource(
+                asset_id=row["asset_id"],
+                resource_key=row["resource_key"],
+                relative_path=row["relative_path"],
+                size=row["size"],
+                checksum=row["checksum"],
+                downloaded_at=row["downloaded_at"],
+            )
+
     def resource_count(self) -> int:
         """Return the number of tracked resources in the manifest."""
 
@@ -281,6 +306,13 @@ class MemoryPhotoSyncState:
         """Iterate preview resource rows."""
 
         yield from self._resources.values()
+
+    def iter_resources_by_asset(self, asset_id: str) -> Iterator[SyncedPhotoResource]:
+        """Iterate preview resource rows for a given asset."""
+
+        for key, resource in self._resources.items():
+            if key[0] == asset_id:
+                yield resource
 
     def resource_count(self) -> int:
         """Return the number of preview manifest rows."""
